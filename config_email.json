@@ -1,0 +1,6 @@
+{
+  "smtp_host": "mail.viman.com.br",
+  "smtp_porta": "587",
+  "usuario": "certificados@viman.com.br",
+  "senha": "hsbpvtsw453@"
+}
