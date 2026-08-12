@@ -58,6 +58,7 @@ def _desabilitar_startup():
 
 from cryptography.hazmat.primitives.serialization.pkcs12 import load_key_and_certificates
 from cryptography.x509 import load_pem_x509_certificate
+from cryptography.x509.oid import NameOID
 from cryptography.hazmat.backends import default_backend
 from cryptography.fernet import Fernet
 
@@ -123,7 +124,7 @@ def _init_db():
                 arquivo_ext   TEXT DEFAULT 'pfx',
                 senha_enc     TEXT DEFAULT '',
                 ultimo_alerta TEXT DEFAULT '',
-                dias_alerta   INTEGER DEFAULT 15,
+                dias_alerta   INTEGER DEFAULT 30,
                 enviar_alerta INTEGER DEFAULT 1
             );
             CREATE TABLE IF NOT EXISTS historico (
@@ -140,7 +141,8 @@ def _init_db():
             );
             CREATE TABLE IF NOT EXISTS senha_mestre (
                 id   INTEGER PRIMARY KEY CHECK (id = 1),
-                hash TEXT NOT NULL
+                hash TEXT NOT NULL,
+                salt TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS log_emails (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -209,8 +211,12 @@ DIAS_ALERTA_INICIO = 30
 # ─────────────────────────────────────────────
 #  SENHA MESTRE
 # ─────────────────────────────────────────────
-def _hash_senha(senha: str) -> str:
-    return hashlib.sha256(senha.encode()).hexdigest()
+_PBKDF2_ITERACOES = 200_000
+
+def _hash_senha(senha: str, salt: bytes) -> str:
+    """Deriva um hash da senha mestre usando PBKDF2-HMAC-SHA256 com salt."""
+    dk = hashlib.pbkdf2_hmac("sha256", senha.encode("utf-8"), salt, _PBKDF2_ITERACOES)
+    return dk.hex()
 
 def senha_mestre_definida() -> bool:
     with _db_lock, _conectar() as conn:
@@ -219,17 +225,20 @@ def senha_mestre_definida() -> bool:
 
 def verificar_senha_mestre(senha: str) -> bool:
     with _db_lock, _conectar() as conn:
-        row = conn.execute("SELECT hash FROM senha_mestre WHERE id=1").fetchone()
+        row = conn.execute("SELECT hash, salt FROM senha_mestre WHERE id=1").fetchone()
         if not row:
             return False
-        return row["hash"] == _hash_senha(senha)
+        salt = bytes.fromhex(row["salt"])
+        return row["hash"] == _hash_senha(senha, salt)
 
 def definir_senha_mestre(senha: str):
+    salt = os.urandom(16)
+    hash_senha = _hash_senha(senha, salt)
     with _db_lock, _conectar() as conn:
         conn.execute(
-            "INSERT INTO senha_mestre (id, hash) VALUES (1, ?) "
-            "ON CONFLICT(id) DO UPDATE SET hash=excluded.hash",
-            (_hash_senha(senha),)
+            "INSERT INTO senha_mestre (id, hash, salt) VALUES (1, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET hash=excluded.hash, salt=excluded.salt",
+            (hash_senha, salt.hex())
         )
 
 def pedir_senha_mestre(parent=None) -> bool:
@@ -353,24 +362,6 @@ def carregar_certificados() -> list:
             return certs
     return _executar_com_retry(_fazer)
 
-def _carregar_certificados_original() -> list:
-    with _db_lock, _conectar() as conn:
-        rows = conn.execute("SELECT * FROM certificados ORDER BY vencimento").fetchall()
-        certs = []
-        for row in rows:
-            c = _row_to_cert(row)
-            hist_rows = conn.execute(
-                "SELECT * FROM historico WHERE cert_id=? ORDER BY id DESC LIMIT 90",
-                (c["id"],)
-            ).fetchall()
-            c["historico"] = [
-                {**json.loads(h["info_json"]),
-                 "data": h["data"], "hora": h["hora"], "acao": h["acao"]}
-                for h in reversed(hist_rows)
-            ]
-            certs.append(c)
-    return certs
-
 def salvar_certificado(cert: dict):
     def _fazer():
       with _db_lock, _conectar() as conn:
@@ -405,7 +396,7 @@ def salvar_certificado(cert: dict):
             "arquivo_ext":   cert.get("arquivo_ext", "pfx"),
             "senha_enc":     cert.get("senha_enc", ""),
             "ultimo_alerta": cert.get("ultimo_alerta", ""),
-            "dias_alerta":   int(cert.get("dias_alerta", 15)),
+            "dias_alerta":   int(cert.get("dias_alerta", 30)),
             "enviar_alerta": 1 if cert.get("enviar_alerta", True) else 0,
           })
     _executar_com_retry(_fazer)
@@ -433,7 +424,7 @@ def registrar_historico_db(cert_id: str, acao: str, **extras):
     _executar_com_retry(_fazer)
 
 def _migrar_colunas_log():
-    """Adiciona colunas novas se o banco foi criado antes desta versão."""
+    """Adiciona colunas/tabelas novas se o banco foi criado antes desta versão."""
     try:
         with _db_lock, _conectar() as conn:
             # log_emails
@@ -445,11 +436,19 @@ def _migrar_colunas_log():
             # certificados
             colunas_cert = [row[1] for row in conn.execute("PRAGMA table_info(certificados)").fetchall()]
             if "dias_alerta" not in colunas_cert:
-                conn.execute("ALTER TABLE certificados ADD COLUMN dias_alerta INTEGER DEFAULT 15")
+                conn.execute("ALTER TABLE certificados ADD COLUMN dias_alerta INTEGER DEFAULT 30")
             if "enviar_alerta" not in colunas_cert:
                 conn.execute("ALTER TABLE certificados ADD COLUMN enviar_alerta INTEGER DEFAULT 1")
-    except Exception:
-        pass
+            # senha_mestre: migração de esquema antigo (sem salt) para o novo (com salt)
+            colunas_mestre = [row[1] for row in conn.execute("PRAGMA table_info(senha_mestre)").fetchall()]
+            if colunas_mestre and "salt" not in colunas_mestre:
+                # Esquema antigo usava SHA256 sem salt. Não é possível migrar o hash
+                # existente com segurança, então limpamos para forçar a redefinição
+                # da senha mestre (o usuário será solicitado a criar uma nova).
+                conn.execute("ALTER TABLE senha_mestre ADD COLUMN salt TEXT DEFAULT ''")
+                conn.execute("DELETE FROM senha_mestre")
+    except Exception as e:
+        print(f"[aviso] Falha ao migrar colunas do banco: {e}")
 
 def registrar_log_email(cert: dict, destinatarios: list, assunto: str, status: str, erro: str = "", origem: str = "automatico"):
     def _fazer():
@@ -546,16 +545,6 @@ def _get_config(chave: str, default=None):
             return default
     return _executar_com_retry(_fazer)
 
-def _get_config_original(chave: str, default=None):
-    with _db_lock, _conectar() as conn:
-        row = conn.execute("SELECT valor FROM configuracoes WHERE chave=?", (chave,)).fetchone()
-        if row:
-            try:
-                return json.loads(row["valor"])
-            except Exception:
-                return row["valor"]
-        return default
-
 def _set_config(chave: str, valor):
     def _fazer():
       with _db_lock, _conectar() as conn:
@@ -567,10 +556,19 @@ def _set_config(chave: str, valor):
     _executar_com_retry(_fazer)
 
 def carregar_config_email() -> dict:
-    return _get_config("config_email", {})
+    """Carrega a configuracao de e-mail e descriptografa a senha SMTP."""
+    cfg = _get_config("config_email", {})
+    cfg = dict(cfg) if cfg else {}
+    if cfg.get("senha"):
+        cfg["senha"] = descriptografar_senha(cfg["senha"])
+    return cfg
 
 def salvar_config_email(cfg: dict):
-    _set_config("config_email", cfg)
+    """Salva a configuracao de e-mail, criptografando a senha SMTP antes de persistir."""
+    cfg_para_salvar = dict(cfg)
+    if cfg_para_salvar.get("senha"):
+        cfg_para_salvar["senha"] = criptografar_senha(cfg_para_salvar["senha"])
+    _set_config("config_email", cfg_para_salvar)
 
 def carregar_template() -> dict:
     return _get_config("template_email", TEMPLATE_PADRAO)
@@ -602,9 +600,7 @@ def ler_certificado_pfx(caminho, senha):
     _, cert, _ = load_key_and_certificates(
         dados, senha.encode() if senha else None, default_backend()
     )
-    nome = cert.subject.get_attributes_for_oid(
-        __import__("cryptography.x509.oid", fromlist=["NameOID"]).NameOID.COMMON_NAME
-    )[0].value
+    nome = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
     vencimento = cert.not_valid_after_utc.date() if hasattr(cert, "not_valid_after_utc") \
                  else cert.not_valid_after.date()
     return nome, str(vencimento)
@@ -613,9 +609,7 @@ def ler_certificado_pem(caminho):
     with open(caminho, "rb") as f:
         dados = f.read()
     cert = load_pem_x509_certificate(dados, default_backend())
-    nome = cert.subject.get_attributes_for_oid(
-        __import__("cryptography.x509.oid", fromlist=["NameOID"]).NameOID.COMMON_NAME
-    )[0].value
+    nome = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
     vencimento = cert.not_valid_after_utc.date() if hasattr(cert, "not_valid_after_utc") \
                  else cert.not_valid_after.date()
     return nome, str(vencimento)
@@ -707,7 +701,7 @@ def verificar_certificados(app=None):
         if not cert.get("enviar_alerta", 1):
             continue
 
-        dias_inicio = int(cert.get("dias_alerta") or 15)
+        dias_inicio = int(cert.get("dias_alerta") or 30)
         if dias > dias_inicio:
             continue
         if cert.get("ultimo_alerta") == hoje:
@@ -893,7 +887,7 @@ class JanelaCertificado(tk.Toplevel):
 
         self.lbl_dias_alerta = ttk.Label(f_alerta, text="Iniciar envio (dias antes):")
         self.lbl_dias_alerta.grid(row=1, column=0, sticky="w", padx=(0, 6))
-        self.var_dias_alerta = tk.StringVar(value="15")
+        self.var_dias_alerta = tk.StringVar(value="30")
         self.spin_dias_alerta = ttk.Spinbox(
             f_alerta, textvariable=self.var_dias_alerta,
             from_=1, to=365, width=6, state="normal"
@@ -1014,7 +1008,7 @@ class JanelaCertificado(tk.Toplevel):
         self.var_emails.set(c.get("emails", ""))
         enviar = bool(c.get("enviar_alerta", 1))
         self.var_enviar_alerta.set(enviar)
-        self.var_dias_alerta.set(str(c.get("dias_alerta") or 15))
+        self.var_dias_alerta.set(str(c.get("dias_alerta") or 30))
         self._toggle_alerta()
         self.var_arquivo.set(c.get("arquivo_nome", ""))
         # O campo de senha sempre inicia em branco por seguranca.
@@ -1085,7 +1079,7 @@ class JanelaCertificado(tk.Toplevel):
             # Se o vencimento mudou (renovacao), zera o ultimo_alerta para que
             # o novo ciclo de lembretes comece do zero.
             "ultimo_alerta": "" if venc_mudou else cert_existente.get("ultimo_alerta", ""),
-            "dias_alerta":   int(self.var_dias_alerta.get() or 15),
+            "dias_alerta":   int(self.var_dias_alerta.get() or 30),
             "enviar_alerta": enviar_alerta_final,
         }
 
@@ -1252,6 +1246,8 @@ class App(tk.Tk):
         btn("Log E-mails",     self.abrir_log_emails,  "#b45309")
         btn("Config. E-mail",  self.config_email)
         btn("Template",        self.config_template)
+        sep()
+        btn("Exportar CSV",    self.exportar_certificados_csv, "#16a34a")
         sep()
 
         tk.Label(tb, text="Filtro:", bg="#223366", fg="#cbd5e1",
@@ -1487,11 +1483,22 @@ class App(tk.Tk):
                          relief="flat", bd=6, justify="center")
         entry.pack(side="left", fill="x", expand=True, ipady=6)
 
+        def _limpar_clipboard_se_ainda_e_senha():
+            """So limpa o clipboard se ele ainda contiver a senha copiada
+            (evita apagar algo diferente que o usuario tenha copiado depois)."""
+            try:
+                if win.clipboard_get() == senha:
+                    win.clipboard_clear()
+            except Exception:
+                pass
+
         def _copiar():
             win.clipboard_clear()
             win.clipboard_append(senha)
             btn_copiar.config(text="Copiado!", bg="#16a34a")
             win.after(1500, lambda: btn_copiar.config(text="Copiar", bg="#7c3aed"))
+            # Remove a senha da area de transferencia apos 30s por seguranca
+            win.after(30000, _limpar_clipboard_se_ainda_e_senha)
 
         btn_copiar = tk.Button(f_row, text="Copiar", command=_copiar,
                                bg="#7c3aed", fg="#ffffff", relief="flat",
@@ -1507,7 +1514,7 @@ class App(tk.Tk):
                                           font=("Segoe UI", 22, "bold"))
         self._countdown_label.pack()
 
-        tk.Button(win, text="Fechar", command=win.destroy,
+        tk.Button(win, text="Fechar", command=lambda: [_limpar_clipboard_se_ainda_e_senha(), win.destroy()],
                   bg="#6d28d9", fg="#ffffff", relief="flat",
                   font=("Segoe UI", 9, "bold"), padx=20, pady=6,
                   cursor="hand2").pack(pady=14)
@@ -1519,6 +1526,7 @@ class App(tk.Tk):
                 return
             self._countdown_label.config(text=str(n))
             if n <= 0:
+                _limpar_clipboard_se_ainda_e_senha()
                 win.destroy()
             else:
                 win.after(1000, lambda: _tick(n - 1))
@@ -1603,6 +1611,71 @@ class App(tk.Tk):
 
     def abrir_log_emails(self):
         JanelaLogEmails(self)
+
+    def exportar_certificados_csv(self):
+        """Exporta a listagem completa de certificados cadastrados para CSV,
+        incluindo todos os campos armazenados (exceto senha e arquivo binario,
+        por seguranca)."""
+        certs = carregar_certificados()
+        if not certs:
+            messagebox.showwarning("Atencao", "Nao ha certificados cadastrados para exportar.", parent=self)
+            return
+
+        destino = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("Todos", "*.*")],
+            initialfile=f"certificados_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        )
+        if not destino:
+            return
+
+        try:
+            import csv
+            campos = [
+                "id", "tipo", "nome", "responsavel", "vencimento",
+                "dias_restantes", "situacao", "emails", "obs",
+                "arquivo_nome", "dias_alerta", "enviar_alerta", "ultimo_alerta"
+            ]
+            with open(destino, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f, delimiter=";")
+                writer.writerow([
+                    "ID", "Tipo", "Nome/Razao Social", "Responsavel", "Vencimento",
+                    "Dias Restantes", "Situacao", "E-mails", "Observacao",
+                    "Arquivo", "Dias Antes p/ Alerta", "Lembrete Ativo", "Ultimo Alerta Enviado"
+                ])
+                for c in certs:
+                    try:
+                        dias = (date.fromisoformat(c["vencimento"]) - date.today()).days
+                    except Exception:
+                        dias = ""
+                    if dias == "":
+                        situacao = ""
+                    elif dias < 0:
+                        situacao = "Vencido"
+                    elif dias <= 7:
+                        situacao = "Critico"
+                    elif dias <= 30:
+                        situacao = "Atencao"
+                    else:
+                        situacao = "OK"
+                    writer.writerow([
+                        c.get("id", ""),
+                        c.get("tipo", ""),
+                        c.get("nome", ""),
+                        c.get("responsavel", ""),
+                        c.get("vencimento", ""),
+                        dias,
+                        situacao,
+                        c.get("emails", ""),
+                        c.get("obs", ""),
+                        c.get("arquivo_nome", ""),
+                        c.get("dias_alerta", ""),
+                        "Sim" if c.get("enviar_alerta", 1) else "Nao",
+                        c.get("ultimo_alerta", ""),
+                    ])
+            messagebox.showinfo("Exportado", f"Listagem exportada com sucesso para:\n{destino}", parent=self)
+        except Exception as e:
+            messagebox.showerror("Erro", f"Nao foi possivel exportar:\n{e}", parent=self)
 
     def atualizar_manual(self):
         self.status_bar.config(text="  Atualizando lista...")
