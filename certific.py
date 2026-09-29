@@ -702,15 +702,37 @@ def verificar_certificados(app=None):
             continue
 
         dias_inicio = int(cert.get("dias_alerta") or 30)
-        if dias > dias_inicio:
+        
+        # 1. Avalia quem deve ser notificado hoje
+        enviar_para_cliente = (dias <= dias_inicio)
+        enviar_para_escritorio = (dias in [15, 5, 1])
+        
+        # Se não for dia de notificar nem o cliente e nem o escritório, pula
+        if not (enviar_para_cliente or enviar_para_escritorio):
             continue
+            
+        # Evita envios duplicados no mesmo dia para o mesmo certificado
         if cert.get("ultimo_alerta") == hoje:
             continue
 
-        destinatarios = [e.strip() for e in cert.get("emails", "").split(",") if e.strip()]
-        if not destinatarios:
-            destinatarios = [config.get("usuario", "")]
-        destinatarios = [d for d in destinatarios if d]
+        destinatarios_final = []
+        
+        # 2. Se estiver dentro do prazo do cliente, adiciona o e-mail do cadastro
+        if enviar_para_cliente:
+            dest_cliente = [e.strip() for e in cert.get("emails", "").split(",") if e.strip()]
+            if not dest_cliente:
+                dest_cliente = [config.get("usuario", "")]
+            destinatarios_final.extend(dest_cliente)
+            
+        # 3. Se for exatamente 15, 5 ou 1 dia, adiciona Diógenes e Tatiana
+        if enviar_para_escritorio:
+            destinatarios_final.extend([
+                "diogenes.daniel@viman.com.br", 
+                "tatiana.villa@viman.com.br"
+            ])
+            
+        # Limpa vazios e remove duplicatas (caso o cliente seja o mesmo e-mail do escritório)
+        destinatarios = list(set([d for d in destinatarios_final if d]))
 
         if destinatarios:
             ok, msg = enviar_email(config, destinatarios, cert)
@@ -1214,7 +1236,7 @@ class App(tk.Tk):
         m_conf.add_separator()
         m_conf.add_command(label="Iniciar com o Windows", command=self.toggle_startup)
         m_acao = tk.Menu(mb, tearoff=0)
-        mb.add_cascade(label="Acoes", menu=m_acao)
+        mb.add_cascade(label="Ações", menu=m_acao)
         m_acao.add_command(label="Verificar agora", command=self.verificar_agora)
         m_acao.add_command(label="Atualizar lista", command=self.atualizar_tabela)
         m_acao.add_separator()
