@@ -14,12 +14,20 @@ try:
 except ImportError:
     TRAY_DISPONIVEL = False
 
-# Tentativa de importar o calendário (se não existir, usa Entry normal)
 try:
     from tkcalendar import DateEntry
     TKCALENDAR_DISPONIVEL = True
 except ImportError:
     TKCALENDAR_DISPONIVEL = False
+
+# Importação para os Gráficos do Dashboard
+try:
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.figure import Figure
+    from matplotlib.gridspec import GridSpec
+    MATPLOTLIB_DISPONIVEL = True
+except ImportError:
+    MATPLOTLIB_DISPONIVEL = False
 
 # Importando nossos modulos refatorados
 import config
@@ -398,8 +406,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Gerenciador de Certificados Digitais")
-        self.geometry("1100x620")
-        self.minsize(900, 480)
+        self.geometry("1100x680")
+        self.minsize(900, 520)
         self.configure(bg=config.COR_BG)
         self._tray_icon = None
         
@@ -408,11 +416,23 @@ class App(tk.Tk):
         
         self._apply_style()
         self._build_header()
-        self._build_toolbar()
-        self._build_table()
+
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True, padx=10, pady=(10, 0))
+
+        self.tab_dash = tk.Frame(self.notebook, bg=config.COR_BG)
+        self.notebook.add(self.tab_dash, text="   📊 Dashboard Geral   ")
+        self._build_dashboard(self.tab_dash)
+
+        self.tab_lista = tk.Frame(self.notebook, bg=config.COR_BG)
+        self.notebook.add(self.tab_lista, text="   📋 Gestão de Certificados   ")
+        self._build_toolbar(self.tab_lista)
+        self._build_table(self.tab_lista)
+
         self._build_statusbar()
         self.atualizar_tabela()
         self._iniciar_auto_refresh()
+        
         email_service.iniciar_scheduler(self)
         threading.Thread(target=email_service.verificar_certificados, args=(self,), daemon=True).start()
         
@@ -506,8 +526,180 @@ class App(tk.Tk):
         m_acao.add_separator()
         m_acao.add_command(label="Log de E-mails", command=self.abrir_log_emails)
 
-    def _build_toolbar(self):
-        tb = tk.Frame(self, bg="#223366", pady=6)
+    def _build_dashboard(self, parent):
+        if not MATPLOTLIB_DISPONIVEL:
+            tk.Label(parent, text="Para visualizar o Dashboard, abra o terminal e instale o matplotlib:\n\npip install matplotlib",
+                     bg=config.COR_BG, fg=config.COR_PRIMARIA, font=("Segoe UI", 12)).pack(expand=True)
+            return
+        self.f_cards = tk.Frame(parent, bg=config.COR_BG)
+        self.f_cards.pack(fill="x", pady=15, padx=10)
+        self.f_charts = tk.Frame(parent, bg=config.COR_BG)
+        self.f_charts.pack(fill="both", expand=True, padx=10, pady=10)
+
+    def atualizar_dashboard(self):
+        if not MATPLOTLIB_DISPONIVEL:
+            return
+
+        certs = database.carregar_certificados()
+        hoje = date.today()
+        mes_atual = hoje.month
+        ano_atual = hoje.year
+        prox_mes = mes_atual + 1 if mes_atual < 12 else 1
+        ano_prox = ano_atual if mes_atual < 12 else ano_atual + 1
+
+        vence_neste_mes = 0
+        vence_prox_mes = 0
+        vencidos = 0
+        ativos = 0
+
+        status_counts = {"Vencidos": 0, "Até 30 dias": 0, "31 a 60 dias": 0, "Acima de 60 dias": 0}
+        tipo_counts = {"A1": 0, "A3": 0}
+
+        for c in certs:
+            tipo = c.get("tipo", "A1")
+            if tipo in tipo_counts:
+                tipo_counts[tipo] += 1
+            else:
+                tipo_counts["A1"] += 1
+
+            try:
+                venc = date.fromisoformat(c["vencimento"])
+                dias = (venc - hoje).days
+
+                if dias < 0:
+                    vencidos += 1
+                    status_counts["Vencidos"] += 1
+                else:
+                    ativos += 1
+                    if dias <= 30:
+                        status_counts["Até 30 dias"] += 1
+                    elif dias <= 60:
+                        status_counts["31 a 60 dias"] += 1
+                    else:
+                        status_counts["Acima de 60 dias"] += 1
+
+                    if venc.month == mes_atual and venc.year == ano_atual:
+                        vence_neste_mes += 1
+                    elif venc.month == prox_mes and venc.year == ano_prox:
+                        vence_prox_mes += 1
+            except Exception:
+                pass
+
+        for widget in self.f_cards.winfo_children():
+            widget.destroy()
+
+        def criar_card(parent, titulo, valor, cor_bg, cor_fg, filtro_alvo):
+            f = tk.Frame(parent, bg=cor_bg, bd=0, relief="flat", highlightbackground="#cbd5e1", highlightthickness=1, cursor="hand2")
+            f.pack(side="left", fill="both", expand=True, padx=8)
+            lbl_tit = tk.Label(f, text=titulo, bg=cor_bg, fg=cor_fg, font=("Segoe UI", 10, "bold"), cursor="hand2")
+            lbl_tit.pack(pady=(15, 5))
+            lbl_val = tk.Label(f, text=str(valor), bg=cor_bg, fg=cor_fg, font=("Segoe UI", 26, "bold"), cursor="hand2")
+            lbl_val.pack(pady=(0, 15))
+
+            # Evento de duplo clique no cartão que muda o filtro e salta de aba
+            def on_click(e):
+                self.var_status_filtro.set(filtro_alvo)
+                self.notebook.select(self.tab_lista) # Muda para a aba de gestão
+
+            f.bind("<Double-1>", on_click)
+            lbl_tit.bind("<Double-1>", on_click)
+            lbl_val.bind("<Double-1>", on_click)
+
+        criar_card(self.f_cards, "Vencem Este Mês", vence_neste_mes, "#fef3c7", "#d97706", "Vencem Este Mês")
+        criar_card(self.f_cards, "Vencem Próximo Mês", vence_prox_mes, "#e0f2fe", "#0284c7", "Vencem Próx. Mês")
+        criar_card(self.f_cards, "Certificados Ativos", ativos, "#dcfce7", "#166534", "Ativos")
+        criar_card(self.f_cards, "Certificados Vencidos", vencidos, "#fee2e2", "#991b1b", "Vencidos")
+
+        for widget in self.f_charts.winfo_children():
+            widget.destroy()
+
+        fig = Figure(figsize=(10, 5), dpi=100, facecolor=config.COR_BG)
+        gs = GridSpec(2, 2, figure=fig, height_ratios=[1.2, 1])
+        
+        ax1 = fig.add_subplot(gs[:, 0])
+        labels_pie = []
+        sizes_pie = []
+        colors_pie = []
+        cores_map = {"Vencidos": "#ef4444", "Até 30 dias": "#f97316", "31 a 60 dias": "#eab308", "Acima de 60 dias": "#22c55e"}
+
+        for k, v in status_counts.items():
+            if v > 0:
+                labels_pie.append(k)
+                sizes_pie.append(v)
+                colors_pie.append(cores_map[k])
+
+        if sizes_pie:
+            ax1.pie(sizes_pie, labels=labels_pie, colors=colors_pie, autopct='%1.1f%%', startangle=140, textprops={'fontsize': 9})
+            ax1.set_title("Status de Validade", fontdict={'fontweight': 'bold', 'fontsize': 11})
+        else:
+            ax1.text(0.5, 0.5, "Sem dados registados", ha='center', va='center')
+            ax1.axis('off')
+
+        ax2 = fig.add_subplot(gs[0, 1])
+        meses_pt = {1:"Jan", 2:"Fev", 3:"Mar", 4:"Abr", 5:"Mai", 6:"Jun", 7:"Jul", 8:"Ago", 9:"Set", 10:"Out", 11:"Nov", 12:"Dez"}
+        meses_bar = []
+        valores_bar = [0, 0, 0, 0, 0, 0]
+
+        for i in range(6):
+            m = hoje.month + i
+            y = hoje.year
+            if m > 12:
+                m -= 12
+                y += 1
+            meses_bar.append(f"{meses_pt[m]}/{y}")
+
+        for c in certs:
+            try:
+                venc = date.fromisoformat(c["vencimento"])
+                if venc >= hoje:
+                    for i in range(6):
+                        m = hoje.month + i
+                        y = hoje.year
+                        if m > 12:
+                            m -= 12
+                            y += 1
+                        if venc.month == m and venc.year == y:
+                            valores_bar[i] += 1
+                            break
+            except:
+                pass
+
+        ax2.bar(meses_bar, valores_bar, color=config.COR_SECUNDARIA, width=0.5)
+        ax2.set_title("Vencimentos (Próx. 6 Meses)", fontdict={'fontweight': 'bold', 'fontsize': 10})
+        ax2.tick_params(axis='x', rotation=0, labelsize=8)
+        from matplotlib.ticker import MaxNLocator
+        ax2.yaxis.set_major_locator(MaxNLocator(integer=True))
+        for i, v in enumerate(valores_bar):
+            if v > 0:
+                ax2.text(i, v + 0.1, str(v), color='black', ha='center', fontsize=8, fontweight='bold')
+
+        ax3 = fig.add_subplot(gs[1, 1])
+        labels_tipo = []
+        sizes_tipo = []
+        colors_tipo = []
+        cores_tipo_map = {"A1": "#3b82f6", "A3": "#8b5cf6"}
+
+        for k, v in tipo_counts.items():
+            if v > 0:
+                labels_tipo.append(k)
+                sizes_tipo.append(v)
+                colors_tipo.append(cores_tipo_map[k])
+
+        if sizes_tipo:
+            explode = [0.05 if i == 0 else 0 for i in range(len(sizes_tipo))]
+            ax3.pie(sizes_tipo, labels=labels_tipo, colors=colors_tipo, autopct='%1.1f%%', startangle=90, textprops={'fontsize': 8}, explode=explode)
+            ax3.set_title("Proporção A1 vs A3", fontdict={'fontweight': 'bold', 'fontsize': 10})
+        else:
+            ax3.axis('off')
+
+        fig.tight_layout(pad=1.5)
+
+        canvas_chart = FigureCanvasTkAgg(fig, master=self.f_charts)
+        canvas_chart.draw()
+        canvas_chart.get_tk_widget().pack(fill="both", expand=True)
+
+    def _build_toolbar(self, parent):
+        tb = tk.Frame(parent, bg="#223366", pady=6)
         tb.pack(fill="x")
         def btn(text, cmd, color=config.COR_SECUNDARIA):
             b = tk.Button(tb, text=text, command=cmd, bg=color, fg="#ffffff", activebackground="#1d4ed8", activeforeground="#ffffff", relief="flat", font=("Segoe UI", 9, "bold"), padx=10, pady=5, cursor="hand2", borderwidth=0)
@@ -527,23 +719,38 @@ class App(tk.Tk):
         sep()
         btn("Exportar CSV", self.exportar_certificados_csv, "#16a34a")
         sep()
-        tk.Label(tb, text="Filtro:", bg="#223366", fg="#cbd5e1", font=("Segoe UI", 9)).pack(side="left")
+        
+        # Filtro de Status (O NOVO COMBBOX PARA OS CARTOES)
+        tk.Label(tb, text="Status:", bg="#223366", fg="#cbd5e1", font=("Segoe UI", 9)).pack(side="left")
+        self.var_status_filtro = tk.StringVar(value="Todos")
+        cb_status = ttk.Combobox(tb, textvariable=self.var_status_filtro, values=["Todos", "Vencem Este Mês", "Vencem Próx. Mês", "Ativos", "Vencidos"], state="readonly", width=16)
+        cb_status.pack(side="left", padx=2)
+        self.var_status_filtro.trace_add("write", lambda *_: self.atualizar_tabela())
+        
+        sep()
+        
+        # Filtro de Texto
+        tk.Label(tb, text="Nome:", bg="#223366", fg="#cbd5e1", font=("Segoe UI", 9)).pack(side="left")
         self.var_filtro = tk.StringVar()
         self.var_filtro.trace_add("write", lambda *_: self.atualizar_tabela())
         tk.Entry(tb, textvariable=self.var_filtro, width=20, font=("Segoe UI", 9), relief="flat", bg="#334466", fg="#ffffff", insertbackground="#ffffff").pack(side="left", padx=(4, 2), ipady=3)
+        
+        # Filtro de Tipo
         self.var_tipo_filtro = tk.StringVar(value="Todos")
-        cb = ttk.Combobox(tb, textvariable=self.var_tipo_filtro, values=["Todos", "A1", "A3"], state="readonly", width=8)
+        cb = ttk.Combobox(tb, textvariable=self.var_tipo_filtro, values=["Todos", "A1", "A3"], state="readonly", width=6)
         cb.pack(side="left", padx=2)
         self.var_tipo_filtro.trace_add("write", lambda *_: self.atualizar_tabela())
 
-    def _build_table(self):
+    def _build_table(self, parent):
         cols = ("tipo", "nome", "responsavel", "vencimento", "dias", "situacao", "emails")
         headers = ("Tipo", "Nome / Razao Social", "Responsavel", "Vencimento", "Dias", "Situacao", "E-mails")
-        frame = tk.Frame(self, bg=config.COR_BG)
-        frame.pack(fill="both", expand=True, padx=10, pady=(6, 0))
+        frame = tk.Frame(parent, bg=config.COR_BG)
+        frame.pack(fill="both", expand=True, padx=10, pady=(6, 10))
         self.tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="browse")
         widths = [50, 180, 120, 100, 50, 80, 160]
         stretches = {"nome": True, "emails": True}
+        
+        # O comando lambda associado aos titulos já executa a ORDENAÇÃO
         for col, hdr, w in zip(cols, headers, widths):
             self.tree.heading(col, text=hdr, command=lambda c=col: self._ordenar(c))
             anchor = "center" if col in ("tipo", "dias", "situacao", "vencimento") else "w"
@@ -572,6 +779,11 @@ class App(tk.Tk):
         self.tree.bind("<Button-5>", lambda _: self.after(30, self._reposicionar_botoes))
 
     def _reposicionar_botoes(self):
+        if self.notebook.index(self.notebook.select()) != 1:
+            for btn in self._btn_mail_widgets.values(): btn.place_forget()
+            for btn in self._btn_senha_widgets.values(): btn.place_forget()
+            return
+
         total_w = sum(self.tree.column(c, "width") for c in self.tree["columns"])
         x_mail, x_senha = total_w - 95, total_w - 185
         for iid, btn in list(self._btn_mail_widgets.items()):
@@ -600,12 +812,33 @@ class App(tk.Tk):
         for row in self.tree.get_children(): self.tree.delete(row)
 
         certs = database.carregar_certificados()
-        filtro, tipo_f = self.var_filtro.get().lower(), self.var_tipo_filtro.get()
+        filtro_texto = self.var_filtro.get().lower()
+        tipo_f = self.var_tipo_filtro.get()
+        status_f = self.var_status_filtro.get()
+        
+        hoje = date.today()
+        mes_atual = hoje.month
+        ano_atual = hoje.year
+        prox_mes = mes_atual + 1 if mes_atual < 12 else 1
+        ano_prox = ano_atual if mes_atual < 12 else ano_atual + 1
+
         for c in certs:
             if tipo_f != "Todos" and c.get("tipo") != tipo_f: continue
-            if filtro and filtro not in c.get("nome", "").lower() and filtro not in c.get("responsavel", "").lower(): continue
-            try: dias = (date.fromisoformat(c["vencimento"]) - date.today()).days
-            except Exception: dias = 0
+            if filtro_texto and filtro_texto not in c.get("nome", "").lower() and filtro_texto not in c.get("responsavel", "").lower(): continue
+            
+            try:
+                venc = date.fromisoformat(c["vencimento"])
+                dias = (venc - hoje).days
+            except Exception:
+                venc = None
+                dias = 0
+
+            # Filtro Lógico Baseado no clique do Cartão
+            if status_f != "Todos":
+                if status_f == "Vencidos" and dias >= 0: continue
+                if status_f == "Ativos" and dias < 0: continue
+                if status_f == "Vencem Este Mês" and not (venc and venc.month == mes_atual and venc.year == ano_atual): continue
+                if status_f == "Vencem Próx. Mês" and not (venc and venc.month == prox_mes and venc.year == ano_prox): continue
 
             if dias < 0: sit, tag = "Vencido", "vencido"
             elif dias <= 7: sit, tag = "Critico", "critico"
@@ -619,8 +852,12 @@ class App(tk.Tk):
 
         self.after(50, self._reposicionar_botoes)
         self.status_bar.config(text=f"  {len(self.tree.get_children())} certificado(s) exibido(s).   |   Atualizado: {datetime.now().strftime('%H:%M:%S')}")
+        
+        # O Dashboard deve espelhar a base real sempre
+        self.atualizar_dashboard()
 
     def _ordenar(self, col):
+        # Esta é a função que ordena a coluna automaticamente ao ser clicada
         rows = [(self.tree.set(k, col), k) for k in self.tree.get_children("")]
         rows.sort()
         for i, (_, k) in enumerate(rows): self.tree.move(k, "", i)
@@ -968,7 +1205,6 @@ class JanelaLogEmails(tk.Toplevel):
         tk.Label(f_filtros, text="De:", bg="#f1f5f9", font=("Segoe UI", 9)).grid(row=0, column=0, padx=(8,2), sticky="w")
         self.var_dt_ini = tk.StringVar()
         
-        # Integracao do calendario se disponivel
         if TKCALENDAR_DISPONIVEL:
             self.cal_ini = DateEntry(f_filtros, textvariable=self.var_dt_ini, width=11, 
                                      date_pattern='y-mm-dd', background=config.COR_PRIMARIA, 
@@ -1090,7 +1326,6 @@ class JanelaLogEmails(tk.Toplevel):
         self.var_origem.set("Todos")
         self.var_lido.set("Todos")
         
-        # Garante que o calendário limpa visualmente também
         if hasattr(self, 'cal_ini'):
             self.cal_ini.delete(0, "end")
         if hasattr(self, 'cal_fim'):
