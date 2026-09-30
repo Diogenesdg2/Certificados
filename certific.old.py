@@ -1102,33 +1102,15 @@ class JanelaCertificado(tk.Toplevel):
     def _salvar(self):
         nome = self.var_nome.get().strip()
         venc = self.var_venc.get().strip()
-        
         if not nome or not venc:
             messagebox.showwarning("Atencao", "Nome e Vencimento sao obrigatorios.", parent=self)
             return
-            
         try:
             date.fromisoformat(venc)
         except ValueError:
             messagebox.showerror("Erro", "Data invalida. Use o formato AAAA-MM-DD.", parent=self)
             return
 
-        # ---- INÍCIO DO BLOQUEIO DE DUPLICIDADE ----
-        # Define o ID (se for edição, pega o ID atual; se for novo, cria um temporário para comparação)
-        cert_id = self.cert["id"] if self.cert else str(int(time.time()))
-        
-        # Puxa o banco de dados para checar se já existe alguém com esse exato nome
-        certs_existentes = carregar_certificados()
-        for c in certs_existentes:
-            # Compara ignorando letras maiúsculas/minúsculas. Se achar nome igual em ID diferente, bloqueia!
-            if c["nome"].strip().lower() == nome.lower() and c["id"] != cert_id:
-                messagebox.showwarning(
-                    "Certificado Duplicado", 
-                    f"Já existe um certificado cadastrado para:\n\n'{nome}'\n\n"
-                    "Para atualizar um certificado renovado, feche esta tela, selecione o cliente na lista principal e clique em 'Editar'.", 
-                    parent=self
-                )
-                return
         # Campo de senha sempre comeca em branco. Se o usuario nao digitar
         # nada durante uma edicao, mantem a senha ja armazenada intacta.
         senha_digitada = self.var_senha.get().strip()
@@ -1183,24 +1165,6 @@ class JanelaCertificado(tk.Toplevel):
 
         salvar_certificado(dados)
         registrar_historico_db(cert_id, "cadastrado" if is_novo else "editado")
-
-        # Se for um certificado recém-criado, dispara a notificação assincronamente
-        if is_novo:
-            def _enviar_boas_vindas():
-                config_email = carregar_config_email()
-                str_emails = config_email.get("emails_novo_cert", "").replace(";", ",")
-                dest = [e.strip() for e in str_emails.split(",") if e.strip()]
-                
-                if dest:
-                    ok, msg_erro = enviar_email_novo_certificado(config_email, dest, dados)
-                    assunto_log = f"[Novo Certificado] {dados.get('nome', '')} - Disponível para uso"
-                    if ok:
-                        registrar_log_email(dados, dest, assunto_log, "Enviado", origem="automatico")
-                    else:
-                        registrar_log_email(dados, dest, assunto_log, "Erro", erro=msg_erro, origem="automatico")
-
-            # Executa numa thread secundária para não congelar o ecrã enquanto envia
-            threading.Thread(target=_enviar_boas_vindas, daemon=True).start()
 
         if self.callback:
             self.callback()
