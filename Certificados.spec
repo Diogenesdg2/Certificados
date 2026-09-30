@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['certific.py'],
+    ['main.py'],
     pathex=[],
     binaries=[],
     datas=[],
