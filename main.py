@@ -386,17 +386,34 @@ class JanelaCertificado(tk.Toplevel):
         database.salvar_certificado(dados)
         database.registrar_historico_db(cert_id, "cadastrado" if is_novo else "editado")
 
+        # ---- INÍCIO DA ATUALIZAÇÃO DO E-MAIL DE BOAS VINDAS ----
         if is_novo:
-            def _enviar_boas_vindas():
+            self.config(cursor="watch")
+            self.update_idletasks()
+            
+            try:
                 config_email = email_service.carregar_config_email()
                 str_emails = config_email.get("emails_novo_cert", "").replace(";", ",")
                 dest = [e.strip() for e in str_emails.split(",") if e.strip()]
+                assunto_log = f"[Novo Certificado] {dados.get('nome', '')} - Disponível para uso"
+                
                 if dest:
                     ok, msg_erro = email_service.enviar_email_novo_certificado(config_email, dest, dados)
-                    assunto_log = f"[Novo Certificado] {dados.get('nome', '')} - Disponível para uso"
-                    if ok: database.registrar_log_email(dados, dest, assunto_log, "Enviado", origem="automatico")
-                    else: database.registrar_log_email(dados, dest, assunto_log, "Erro", erro=msg_erro, origem="automatico")
-            threading.Thread(target=_enviar_boas_vindas, daemon=True).start()
+                    if ok: 
+                        database.registrar_log_email(dados, dest, assunto_log, "Enviado", origem="automatico")
+                    else: 
+                        database.registrar_log_email(dados, dest, assunto_log, "Erro", erro=msg_erro, origem="automatico")
+                else:
+                    database.registrar_log_email(dados, ["Nenhum configurado"], assunto_log, "Erro", erro="O campo 'E-mails Novo Cert.' nas configurações está vazio.", origem="automatico")
+            
+            except Exception as e:
+                import traceback
+                caminho_erro = os.path.join(os.path.dirname(config.DB_FILE), "erro_email_novo.txt")
+                with open(caminho_erro, "w", encoding="utf-8") as f:
+                    f.write(traceback.format_exc())
+                    
+            self.config(cursor="")
+        # ---- FIM DA ATUALIZAÇÃO ----
 
         if self.callback: self.callback()
         self.destroy()
@@ -596,10 +613,9 @@ class App(tk.Tk):
             lbl_val = tk.Label(f, text=str(valor), bg=cor_bg, fg=cor_fg, font=("Segoe UI", 26, "bold"), cursor="hand2")
             lbl_val.pack(pady=(0, 15))
 
-            # Evento de duplo clique no cartão que muda o filtro e salta de aba
             def on_click(e):
                 self.var_status_filtro.set(filtro_alvo)
-                self.notebook.select(self.tab_lista) # Muda para a aba de gestão
+                self.notebook.select(self.tab_lista) 
 
             f.bind("<Double-1>", on_click)
             lbl_tit.bind("<Double-1>", on_click)
@@ -720,7 +736,6 @@ class App(tk.Tk):
         btn("Exportar CSV", self.exportar_certificados_csv, "#16a34a")
         sep()
         
-        # Filtro de Status (O NOVO COMBBOX PARA OS CARTOES)
         tk.Label(tb, text="Status:", bg="#223366", fg="#cbd5e1", font=("Segoe UI", 9)).pack(side="left")
         self.var_status_filtro = tk.StringVar(value="Todos")
         cb_status = ttk.Combobox(tb, textvariable=self.var_status_filtro, values=["Todos", "Vencem Este Mês", "Vencem Próx. Mês", "Ativos", "Vencidos"], state="readonly", width=16)
@@ -729,13 +744,11 @@ class App(tk.Tk):
         
         sep()
         
-        # Filtro de Texto
         tk.Label(tb, text="Nome:", bg="#223366", fg="#cbd5e1", font=("Segoe UI", 9)).pack(side="left")
         self.var_filtro = tk.StringVar()
         self.var_filtro.trace_add("write", lambda *_: self.atualizar_tabela())
         tk.Entry(tb, textvariable=self.var_filtro, width=20, font=("Segoe UI", 9), relief="flat", bg="#334466", fg="#ffffff", insertbackground="#ffffff").pack(side="left", padx=(4, 2), ipady=3)
         
-        # Filtro de Tipo
         self.var_tipo_filtro = tk.StringVar(value="Todos")
         cb = ttk.Combobox(tb, textvariable=self.var_tipo_filtro, values=["Todos", "A1", "A3"], state="readonly", width=6)
         cb.pack(side="left", padx=2)
@@ -750,7 +763,6 @@ class App(tk.Tk):
         widths = [50, 180, 120, 100, 50, 80, 160]
         stretches = {"nome": True, "emails": True}
         
-        # O comando lambda associado aos titulos já executa a ORDENAÇÃO
         for col, hdr, w in zip(cols, headers, widths):
             self.tree.heading(col, text=hdr, command=lambda c=col: self._ordenar(c))
             anchor = "center" if col in ("tipo", "dias", "situacao", "vencimento") else "w"
@@ -833,7 +845,6 @@ class App(tk.Tk):
                 venc = None
                 dias = 0
 
-            # Filtro Lógico Baseado no clique do Cartão
             if status_f != "Todos":
                 if status_f == "Vencidos" and dias >= 0: continue
                 if status_f == "Ativos" and dias < 0: continue
@@ -853,11 +864,9 @@ class App(tk.Tk):
         self.after(50, self._reposicionar_botoes)
         self.status_bar.config(text=f"  {len(self.tree.get_children())} certificado(s) exibido(s).   |   Atualizado: {datetime.now().strftime('%H:%M:%S')}")
         
-        # O Dashboard deve espelhar a base real sempre
         self.atualizar_dashboard()
 
     def _ordenar(self, col):
-        # Esta é a função que ordena a coluna automaticamente ao ser clicada
         rows = [(self.tree.set(k, col), k) for k in self.tree.get_children("")]
         rows.sort()
         for i, (_, k) in enumerate(rows): self.tree.move(k, "", i)
