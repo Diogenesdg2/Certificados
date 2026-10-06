@@ -342,7 +342,6 @@ class JanelaCertificado(tk.Toplevel):
             messagebox.showerror("Erro", "Data invalida. Use o formato AAAA-MM-DD.", parent=self)
             return
 
-        # ---- INÍCIO DO BLOQUEIO DE DUPLICIDADE ----
         cert_id = self.cert["id"] if self.cert else str(int(time.time()))
         certs_existentes = database.carregar_certificados()
         for c in certs_existentes:
@@ -354,7 +353,6 @@ class JanelaCertificado(tk.Toplevel):
                     parent=self
                 )
                 return
-        # ---- FIM DO BLOQUEIO DE DUPLICIDADE ----
 
         senha_digitada = self.var_senha.get().strip()
         if senha_digitada: senha_enc = crypto_utils.criptografar_senha(senha_digitada)
@@ -371,6 +369,7 @@ class JanelaCertificado(tk.Toplevel):
         is_novo = self.cert is None
         venc_anterior = cert_existente.get("vencimento", "")
         venc_mudou = (not is_novo) and venc_anterior and venc_anterior != venc
+        
         if is_novo or venc_mudou: enviar_alerta_final = True
         else: enviar_alerta_final = self.var_enviar_alerta.get()
 
@@ -386,34 +385,33 @@ class JanelaCertificado(tk.Toplevel):
         database.salvar_certificado(dados)
         database.registrar_historico_db(cert_id, "cadastrado" if is_novo else "editado")
 
-        # ---- INÍCIO DA ATUALIZAÇÃO DO E-MAIL DE BOAS VINDAS ----
-        if is_novo:
-            self.config(cursor="watch")
-            self.update_idletasks()
+        if is_novo or venc_mudou:
+            acao_txt = "guardado" if is_novo else "atualizado/renovado"
+            msg_pergunta = f"Certificado {acao_txt} com sucesso!\n\nDeseja disparar agora o e-mail a avisar o cliente que o certificado já está disponível para uso?"
             
-            try:
-                config_email = email_service.carregar_config_email()
-                str_emails = config_email.get("emails_novo_cert", "").replace(";", ",")
-                dest = [e.strip() for e in str_emails.split(",") if e.strip()]
-                assunto_log = f"[Novo Certificado] {dados.get('nome', '')} - Disponível para uso"
-                
-                if dest:
-                    ok, msg_erro = email_service.enviar_email_novo_certificado(config_email, dest, dados)
-                    if ok: 
-                        database.registrar_log_email(dados, dest, assunto_log, "Enviado", origem="automatico")
-                    else: 
-                        database.registrar_log_email(dados, dest, assunto_log, "Erro", erro=msg_erro, origem="automatico")
-                else:
-                    database.registrar_log_email(dados, ["Nenhum configurado"], assunto_log, "Erro", erro="O campo 'E-mails Novo Cert.' nas configurações está vazio.", origem="automatico")
-            
-            except Exception as e:
-                import traceback
-                caminho_erro = os.path.join(os.path.dirname(config.DB_FILE), "erro_email_novo.txt")
-                with open(caminho_erro, "w", encoding="utf-8") as f:
-                    f.write(traceback.format_exc())
+            if messagebox.askyesno("Enviar Aviso", msg_pergunta, parent=self):
+                self.config(cursor="watch")
+                self.update_idletasks()
+                try:
+                    config_email = email_service.carregar_config_email()
+                    str_emails = config_email.get("emails_novo_cert", "").replace(";", ",")
+                    dest = [e.strip() for e in str_emails.split(",") if e.strip()]
+                    assunto_log = f"[Novo Certificado] {dados.get('nome', '')} - Disponível para uso"
                     
-            self.config(cursor="")
-        # ---- FIM DA ATUALIZAÇÃO ----
+                    if dest:
+                        ok, msg_erro = email_service.enviar_email_novo_certificado(config_email, dest, dados)
+                        if ok: 
+                            database.registrar_log_email(dados, dest, assunto_log, "Enviado", origem="manual")
+                            messagebox.showinfo("Enviado", f"E-mail de novo certificado enviado com sucesso para:\n\n{', '.join(dest)}", parent=self)
+                        else: 
+                            database.registrar_log_email(dados, dest, assunto_log, "Erro", erro=msg_erro, origem="manual")
+                            messagebox.showerror("Erro no Envio", f"O sistema tentou enviar, mas ocorreu o seguinte erro:\n\n{msg_erro}", parent=self)
+                    else:
+                        database.registrar_log_email(dados, ["Nenhum configurado"], assunto_log, "Erro", erro="O campo 'E-mails Novo Cert.' nas configurações está vazio.", origem="manual")
+                        messagebox.showwarning("Atenção", "O envio falhou porque não há destinatários configurados.\n\nVá a Configurações > Configurar E-mail e preencha o campo 'E-mails Novo Cert.'.", parent=self)
+                except Exception as e:
+                    messagebox.showerror("Erro Fatal", f"Ocorreu um erro inesperado ao tentar enviar o e-mail:\n\n{str(e)}", parent=self)
+                self.config(cursor="")
 
         if self.callback: self.callback()
         self.destroy()
@@ -450,6 +448,9 @@ class App(tk.Tk):
         self.atualizar_tabela()
         self._iniciar_auto_refresh()
         
+        # ATALHO CTRL + F1 PARA RESET DE EMERGÊNCIA (DESTRUTIVO)
+        self.bind("<Control-F1>", self._resetar_senha_mestre)
+
         email_service.iniciar_scheduler(self)
         threading.Thread(target=email_service.verificar_certificados, args=(self,), daemon=True).start()
         
@@ -458,6 +459,155 @@ class App(tk.Tk):
             threading.Thread(target=self._iniciar_tray, daemon=True).start()
         else:
             self.protocol("WM_DELETE_WINDOW", self._confirmar_saida)
+
+    # -------------------------------------------------------------------------
+    # FUNÇÃO 1: MIGRAR/ALTERAR A SENHA MESTRE COM SEGURANÇA (NOVA)
+    # -------------------------------------------------------------------------
+    def _alterar_senha_mestre(self):
+        if not crypto_utils.senha_mestre_definida():
+            messagebox.showinfo("Atenção", "A senha mestre ainda não foi definida no sistema.", parent=self)
+            return
+
+        # 1. Autenticar com a senha antiga
+        senha_atual = simpledialog.askstring("Autenticação Necessária", "Digite a senha mestre ATUAL:", show="*", parent=self)
+        if not senha_atual: return
+        
+        if not crypto_utils.verificar_senha_mestre(senha_atual):
+            messagebox.showerror("Erro", "A senha atual está incorreta. Acesso negado.", parent=self)
+            return
+
+        # 2. Criar a nova senha
+        win = tk.Toplevel(self)
+        win.title("Alterar Senha Mestre")
+        win.resizable(False, False)
+        win.grab_set()
+        win.geometry("360x220")
+
+        hdr = tk.Frame(win, bg=config.COR_PRIMARIA, height=44)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        tk.Label(hdr, text="  Alterar Senha Mestre", bg=config.COR_PRIMARIA, fg="#ffffff", font=("Segoe UI", 10, "bold")).pack(side="left", padx=12, pady=10)
+        ttk.Label(win, text="Crie a sua NOVA senha mestre.\nAs senhas dos certificados serão atualizadas automaticamente.", font=("Segoe UI", 9), justify="center").pack(pady=(14, 6))
+
+        f = ttk.Frame(win)
+        f.pack(pady=4)
+        ttk.Label(f, text="Nova senha:").grid(row=0, column=0, sticky="e", padx=6, pady=4)
+        v1 = tk.StringVar()
+        ttk.Entry(f, textvariable=v1, show="*", width=22).grid(row=0, column=1, pady=4)
+        ttk.Label(f, text="Confirmar:").grid(row=1, column=0, sticky="e", padx=6, pady=4)
+        v2 = tk.StringVar()
+        ttk.Entry(f, textvariable=v2, show="*", width=22).grid(row=1, column=1, pady=4)
+
+        def _confirmar():
+            s1, s2 = v1.get().strip(), v2.get().strip()
+            if not s1:
+                messagebox.showwarning("Atenção", "Digite uma senha.", parent=win)
+                return
+            if s1 != s2:
+                messagebox.showerror("Erro", "As senhas não conferem.", parent=win)
+                return
+            
+            try:
+                # PASSO A: Carregar todas as senhas em texto limpo ENQUANTO a chave velha é válida
+                certs = database.carregar_certificados()
+                senhas_cert_limpas = {}
+                for c in certs:
+                    if c.get("senha_enc"):
+                        senhas_cert_limpas[c["id"]] = crypto_utils.descriptografar_senha(c["senha_enc"])
+                
+                cfg_email = email_service.carregar_config_email() # Lê a senha do email de forma limpa
+                
+                # PASSO B: Mudar a chave do sistema para a nova
+                crypto_utils.definir_senha_mestre(s1)
+                
+                # PASSO C: Re-encriptar e salvar tudo com a nova chave
+                for c in certs:
+                    senha_limpa = senhas_cert_limpas.get(c["id"])
+                    if senha_limpa:
+                        c["senha_enc"] = crypto_utils.criptografar_senha(senha_limpa)
+                        database.salvar_certificado(c)
+                        
+                if cfg_email:
+                    email_service.salvar_config_email(cfg_email)
+
+                messagebox.showinfo("Sucesso", "Senha mestre alterada com sucesso!\n\nTodos os certificados e configurações foram recriptografados com a nova chave.", parent=self)
+                win.destroy()
+            except Exception as e:
+                messagebox.showerror("Erro Grave", f"Ocorreu um erro durante a migração das senhas:\n{e}", parent=win)
+
+        bf = ttk.Frame(win)
+        bf.pack(pady=8)
+        ttk.Button(bf, text="Alterar", command=_confirmar).pack(side="left", padx=5)
+        ttk.Button(bf, text="Cancelar", command=win.destroy).pack(side="left", padx=5)
+
+
+    # -------------------------------------------------------------------------
+    # FUNÇÃO 2: RESET DE EMERGÊNCIA (DESTRUTIVO - O ATUAL CTRL+F1)
+    # -------------------------------------------------------------------------
+    def _resetar_senha_mestre(self, event=None):
+        if not crypto_utils.senha_mestre_definida():
+            messagebox.showinfo("Atenção", "A senha mestre ainda não foi definida no sistema.", parent=self)
+            return
+
+        msg = ("ATENÇÃO - MODO DE EMERGÊNCIA:\n\n"
+               "Se perdeu a sua senha mestre e forçar a redefinição agora, "
+               "todas as senhas dos certificados guardadas serão APAGADAS "
+               "(é impossível lê-las sem a senha antiga).\n\n"
+               "Os dados dos clientes e os arquivos (.pfx) continuarão intactos.\n\n"
+               "Tem a certeza absoluta de que deseja forçar o reset da senha mestre?")
+        
+        if messagebox.askyesno("Resetar Senha Mestre", msg, icon='warning', parent=self):
+            win = tk.Toplevel(self)
+            win.title("Forçar Nova Senha")
+            win.resizable(False, False)
+            win.grab_set()
+            win.geometry("360x220")
+
+            hdr = tk.Frame(win, bg="#dc2626", height=44)
+            hdr.pack(fill="x")
+            hdr.pack_propagate(False)
+            tk.Label(hdr, text="  Reset de Emergência", bg="#dc2626", fg="#ffffff", font=("Segoe UI", 10, "bold")).pack(side="left", padx=12, pady=10)
+            ttk.Label(win, text="Crie uma NOVA senha mestre.\nAs senhas antigas serão PERDIDAS.", font=("Segoe UI", 9), justify="center").pack(pady=(14, 6))
+
+            f = ttk.Frame(win)
+            f.pack(pady=4)
+            ttk.Label(f, text="Nova senha:").grid(row=0, column=0, sticky="e", padx=6, pady=4)
+            v1 = tk.StringVar()
+            ttk.Entry(f, textvariable=v1, show="*", width=22).grid(row=0, column=1, pady=4)
+            ttk.Label(f, text="Confirmar:").grid(row=1, column=0, sticky="e", padx=6, pady=4)
+            v2 = tk.StringVar()
+            ttk.Entry(f, textvariable=v2, show="*", width=22).grid(row=1, column=1, pady=4)
+
+            def _confirmar():
+                s1, s2 = v1.get().strip(), v2.get().strip()
+                if not s1:
+                    messagebox.showwarning("Atenção", "Digite uma senha.", parent=win)
+                    return
+                if s1 != s2:
+                    messagebox.showerror("Erro", "As senhas não conferem.", parent=win)
+                    return
+                
+                # Apaga as senhas antigas dos certificados no banco
+                certs = database.carregar_certificados()
+                for c in certs:
+                    if c.get("senha_enc"):
+                        c["senha_enc"] = ""
+                        database.salvar_certificado(c)
+                
+                # Define a nova senha mestre
+                crypto_utils.definir_senha_mestre(s1)
+                
+                messagebox.showinfo("Reset Concluído", "Senha mestre forçada com sucesso!\n\nTerá de digitar as senhas dos certificados manualmente na próxima vez que editar um cliente.", parent=self)
+                win.destroy()
+
+            bf = ttk.Frame(win)
+            bf.pack(pady=8)
+            ttk.Button(bf, text="Confirmar Reset", command=_confirmar).pack(side="left", padx=5)
+            ttk.Button(bf, text="Cancelar", command=win.destroy).pack(side="left", padx=5)
+
+    # -------------------------------------------------------------------------
+    # FIM DA LÓGICA DE SENHAS
+    # -------------------------------------------------------------------------
 
     def _criar_icone_tray(self):
         img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
@@ -523,6 +673,7 @@ class App(tk.Tk):
     def _build_menu(self):
         mb = tk.Menu(self, bg=config.COR_PRIMARIA, fg="#ffffff", activebackground=config.COR_SECUNDARIA, activeforeground="#ffffff", borderwidth=0)
         self.config(menu=mb)
+        
         m_cert = tk.Menu(mb, tearoff=0)
         mb.add_cascade(label="Certificados", menu=m_cert)
         m_cert.add_command(label="Novo certificado", command=self.novo_cert)
@@ -530,12 +681,17 @@ class App(tk.Tk):
         m_cert.add_command(label="Excluir selecionado", command=self.excluir_cert)
         m_cert.add_separator()
         m_cert.add_command(label="Sair", command=self.quit)
+        
         m_conf = tk.Menu(mb, tearoff=0)
         mb.add_cascade(label="Configuracoes", menu=m_conf)
         m_conf.add_command(label="Configurar e-mail", command=self.config_email)
         m_conf.add_command(label="Template do e-mail", command=self.config_template)
         m_conf.add_separator()
+        # ---- NOVO BOTÃO DE MUDAR SENHA NO MENU ----
+        m_conf.add_command(label="Alterar Senha Mestre", command=self._alterar_senha_mestre)
+        m_conf.add_separator()
         m_conf.add_command(label="Iniciar com o Windows", command=self.toggle_startup)
+        
         m_acao = tk.Menu(mb, tearoff=0)
         mb.add_cascade(label="Ações", menu=m_acao)
         m_acao.add_command(label="Verificar agora", command=self.verificar_agora)
