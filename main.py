@@ -34,6 +34,7 @@ import config
 import database
 import crypto_utils
 import email_service
+import backup_service  # <-- NOVO MÓDULO DE BACKUP
 
 STARTUP_REG_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_APP_NAME = "GerenciadorCertificados"
@@ -448,8 +449,12 @@ class App(tk.Tk):
         self.atualizar_tabela()
         self._iniciar_auto_refresh()
         
-        # ATALHO CTRL + F1 PARA RESET DE EMERGÊNCIA (DESTRUTIVO)
         self.bind("<Control-F1>", self._resetar_senha_mestre)
+
+        # Inicia a Thread do Backup Silencioso em Background
+        def _executar_backup():
+            backup_service.realizar_backup_diario(dias_retencao=15, forcar=False)
+        threading.Thread(target=_executar_backup, daemon=True).start()
 
         email_service.iniciar_scheduler(self)
         threading.Thread(target=email_service.verificar_certificados, args=(self,), daemon=True).start()
@@ -461,22 +466,20 @@ class App(tk.Tk):
             self.protocol("WM_DELETE_WINDOW", self._confirmar_saida)
 
     # -------------------------------------------------------------------------
-    # FUNÇÃO 1: MIGRAR/ALTERAR A SENHA MESTRE COM SEGURANÇA (NOVA)
+    # FUNÇÕES DE GESTÃO DA SENHA MESTRE
     # -------------------------------------------------------------------------
     def _alterar_senha_mestre(self):
         if not crypto_utils.senha_mestre_definida():
             messagebox.showinfo("Atenção", "A senha mestre ainda não foi definida no sistema.", parent=self)
             return
 
-        # 1. Autenticar com a senha antiga
-        senha_atual = simpledialog.askstring("Autenticação Necessária", "Digite a senha mestre ATUAL:", show="*", parent=self)
+        senha_atual = simpledialog.askstring("Autenticação", "Digite a senha mestre ATUAL:", show="*", parent=self)
         if not senha_atual: return
         
         if not crypto_utils.verificar_senha_mestre(senha_atual):
             messagebox.showerror("Erro", "A senha atual está incorreta. Acesso negado.", parent=self)
             return
 
-        # 2. Criar a nova senha
         win = tk.Toplevel(self)
         win.title("Alterar Senha Mestre")
         win.resizable(False, False)
@@ -508,19 +511,15 @@ class App(tk.Tk):
                 return
             
             try:
-                # PASSO A: Carregar todas as senhas em texto limpo ENQUANTO a chave velha é válida
                 certs = database.carregar_certificados()
                 senhas_cert_limpas = {}
                 for c in certs:
                     if c.get("senha_enc"):
                         senhas_cert_limpas[c["id"]] = crypto_utils.descriptografar_senha(c["senha_enc"])
                 
-                cfg_email = email_service.carregar_config_email() # Lê a senha do email de forma limpa
-                
-                # PASSO B: Mudar a chave do sistema para a nova
+                cfg_email = email_service.carregar_config_email()
                 crypto_utils.definir_senha_mestre(s1)
                 
-                # PASSO C: Re-encriptar e salvar tudo com a nova chave
                 for c in certs:
                     senha_limpa = senhas_cert_limpas.get(c["id"])
                     if senha_limpa:
@@ -540,10 +539,6 @@ class App(tk.Tk):
         ttk.Button(bf, text="Alterar", command=_confirmar).pack(side="left", padx=5)
         ttk.Button(bf, text="Cancelar", command=win.destroy).pack(side="left", padx=5)
 
-
-    # -------------------------------------------------------------------------
-    # FUNÇÃO 2: RESET DE EMERGÊNCIA (DESTRUTIVO - O ATUAL CTRL+F1)
-    # -------------------------------------------------------------------------
     def _resetar_senha_mestre(self, event=None):
         if not crypto_utils.senha_mestre_definida():
             messagebox.showinfo("Atenção", "A senha mestre ainda não foi definida no sistema.", parent=self)
@@ -587,14 +582,12 @@ class App(tk.Tk):
                     messagebox.showerror("Erro", "As senhas não conferem.", parent=win)
                     return
                 
-                # Apaga as senhas antigas dos certificados no banco
                 certs = database.carregar_certificados()
                 for c in certs:
                     if c.get("senha_enc"):
                         c["senha_enc"] = ""
                         database.salvar_certificado(c)
                 
-                # Define a nova senha mestre
                 crypto_utils.definir_senha_mestre(s1)
                 
                 messagebox.showinfo("Reset Concluído", "Senha mestre forçada com sucesso!\n\nTerá de digitar as senhas dos certificados manualmente na próxima vez que editar um cliente.", parent=self)
@@ -605,8 +598,21 @@ class App(tk.Tk):
             ttk.Button(bf, text="Confirmar Reset", command=_confirmar).pack(side="left", padx=5)
             ttk.Button(bf, text="Cancelar", command=win.destroy).pack(side="left", padx=5)
 
+    def fazer_backup_manual(self):
+        self.status_bar.config(text="  A realizar backup de segurança...")
+        self.update_idletasks()
+        
+        ok, msg = backup_service.realizar_backup_diario(dias_retencao=15, forcar=True)
+        
+        if ok:
+            messagebox.showinfo("Backup Concluído", msg, parent=self)
+            self.status_bar.config(text="  Backup manual efetuado com sucesso.")
+        else:
+            messagebox.showerror("Erro no Backup", f"Não foi possível efetuar o backup:\n\n{msg}", parent=self)
+            self.status_bar.config(text="  Erro ao tentar realizar backup.")
+
     # -------------------------------------------------------------------------
-    # FIM DA LÓGICA DE SENHAS
+    # FIM DA LÓGICA DE SENHAS E BACKUP
     # -------------------------------------------------------------------------
 
     def _criar_icone_tray(self):
@@ -673,7 +679,6 @@ class App(tk.Tk):
     def _build_menu(self):
         mb = tk.Menu(self, bg=config.COR_PRIMARIA, fg="#ffffff", activebackground=config.COR_SECUNDARIA, activeforeground="#ffffff", borderwidth=0)
         self.config(menu=mb)
-        
         m_cert = tk.Menu(mb, tearoff=0)
         mb.add_cascade(label="Certificados", menu=m_cert)
         m_cert.add_command(label="Novo certificado", command=self.novo_cert)
@@ -687,7 +692,6 @@ class App(tk.Tk):
         m_conf.add_command(label="Configurar e-mail", command=self.config_email)
         m_conf.add_command(label="Template do e-mail", command=self.config_template)
         m_conf.add_separator()
-        # ---- NOVO BOTÃO DE MUDAR SENHA NO MENU ----
         m_conf.add_command(label="Alterar Senha Mestre", command=self._alterar_senha_mestre)
         m_conf.add_separator()
         m_conf.add_command(label="Iniciar com o Windows", command=self.toggle_startup)
@@ -696,6 +700,9 @@ class App(tk.Tk):
         mb.add_cascade(label="Ações", menu=m_acao)
         m_acao.add_command(label="Verificar agora", command=self.verificar_agora)
         m_acao.add_command(label="Atualizar lista", command=self.atualizar_tabela)
+        m_acao.add_separator()
+        # ---- NOVO BOTÃO DE BACKUP MANUAL ----
+        m_acao.add_command(label="Realizar Backup Agora", command=self.fazer_backup_manual)
         m_acao.add_separator()
         m_acao.add_command(label="Log de E-mails", command=self.abrir_log_emails)
 
